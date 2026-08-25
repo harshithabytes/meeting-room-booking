@@ -16,6 +16,10 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 
+
+// ===============================
+// HEALTH CHECK
+// ===============================
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -25,6 +29,7 @@ app.get("/api/health", async (req, res) => {
       message: "Meeting Room Booking API is running",
       database: "connected"
     });
+
   } catch (error) {
     console.error("Database connection error:", error);
 
@@ -35,16 +40,28 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+
+// ===============================
+// GET ALL ROOMS
+// ===============================
 app.get("/api/rooms", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, name, location, capacity, facilities FROM meeting_rooms ORDER BY id"
+      `SELECT
+         id,
+         name,
+         location,
+         capacity,
+         facilities
+       FROM meeting_rooms
+       ORDER BY id`
     );
 
     res.status(200).json({
       success: true,
       rooms: result.rows
     });
+
   } catch (error) {
     console.error("Error fetching rooms:", error);
 
@@ -55,7 +72,13 @@ app.get("/api/rooms", async (req, res) => {
   }
 });
 
+
+// ===============================
+// CREATE BOOKING
+// ===============================
 app.post("/api/bookings", async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const {
       room_id,
@@ -66,37 +89,154 @@ app.post("/api/bookings", async (req, res) => {
       purpose
     } = req.body;
 
-    if (!room_id || !user_id || !booking_date || !start_time || !end_time) {
+
+    // -------------------------------
+    // Validate required fields
+    // -------------------------------
+    if (
+      !room_id ||
+      !user_id ||
+      !booking_date ||
+      !start_time ||
+      !end_time
+    ) {
       return res.status(400).json({
         success: false,
         message: "Required fields are missing"
       });
     }
 
-    const conflict = await pool.query(
-      `SELECT id FROM bookings
+
+    // -------------------------------
+    // Validate time
+    // -------------------------------
+    if (start_time >= end_time) {
+      return res.status(400).json({
+        success: false,
+        message: "End time must be after start time"
+      });
+    }
+
+
+    // -------------------------------
+    // Start transaction
+    // -------------------------------
+    await client.query("BEGIN");
+
+
+    // -------------------------------
+    // Lock the room row
+    //
+    // This is important for concurrency.
+    // Two users cannot simultaneously
+    // process a booking for the same room.
+    // -------------------------------
+    const room = await client.query(
+      `SELECT id
+       FROM meeting_rooms
+       WHERE id = $1
+       FOR UPDATE`,
+      [room_id]
+    );
+
+
+    // -------------------------------
+    // Check room exists
+    // -------------------------------
+    if (room.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        message: "Meeting room not found"
+      });
+    }
+
+
+    // -------------------------------
+    // Check overlapping bookings
+    //
+    // Existing:
+    // 10:00 - 11:00
+    //
+    // New:
+    // 10:30 - 11:30
+    //
+    // Conflict = TRUE
+    //
+    // Existing:
+    // 10:00 - 11:00
+    //
+    // New:
+    // 11:00 - 12:00
+    //
+    // Conflict = FALSE
+    // -------------------------------
+    const conflict = await client.query(
+      `SELECT id
+       FROM bookings
        WHERE room_id = $1
        AND booking_date = $2
        AND start_time < $4
-       AND end_time > $3`,
-      [room_id, booking_date, start_time, end_time]
+       AND end_time > $3
+       FOR UPDATE`,
+      [
+        room_id,
+        booking_date,
+        start_time,
+        end_time
+      ]
     );
 
+
+    // -------------------------------
+    // Reject conflicting booking
+    // -------------------------------
     if (conflict.rows.length > 0) {
+      await client.query("ROLLBACK");
+
       return res.status(409).json({
         success: false,
         message: "Room is already booked for this time"
       });
     }
 
-    const result = await pool.query(
+
+    // -------------------------------
+    // Create booking
+    // -------------------------------
+    const result = await client.query(
       `INSERT INTO bookings
-       (room_id, user_id, booking_date, start_time, end_time, purpose)
+       (
+         room_id,
+         user_id,
+         booking_date,
+         start_time,
+         end_time,
+         purpose
+       )
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [room_id, user_id, booking_date, start_time, end_time, purpose || null]
+      [
+        room_id,
+        user_id,
+        booking_date,
+        start_time,
+        end_time,
+        purpose || null
+      ]
     );
 
+
+    // -------------------------------
+    // Commit transaction
+    // -------------------------------
+    await client.query("COMMIT");
+
+
+    // -------------------------------
+    // Success response
+    // -------------------------------
     res.status(201).json({
       success: true,
       message: "Booking created successfully",
@@ -104,33 +244,50 @@ app.post("/api/bookings", async (req, res) => {
     });
 
   } catch (error) {
+
+    // Rollback if anything fails
+    await client.query("ROLLBACK");
+
     console.error("Booking error:", error);
 
     res.status(500).json({
       success: false,
       message: "Failed to create booking"
     });
+
+  } finally {
+
+    // Return connection to pool
+    client.release();
   }
 });
 
+
+// ===============================
+// GET ALL BOOKINGS
+// ===============================
 app.get("/api/bookings", async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        b.id,
-        r.name AS room_name,
-        u.name AS user_name,
-        u.email,
-        b.booking_date,
-        b.start_time,
-        b.end_time,
-        b.purpose,
-        b.status
-      FROM bookings b
-      JOIN meeting_rooms r ON b.room_id = r.id
-      JOIN users u ON b.user_id = u.id
-      ORDER BY b.booking_date, b.start_time
-    `);
+    const result = await pool.query(
+      `SELECT
+         b.id,
+         r.name AS room_name,
+         u.name AS user_name,
+         u.email,
+         b.booking_date,
+         b.start_time,
+         b.end_time,
+         b.purpose,
+         b.status
+       FROM bookings b
+       JOIN meeting_rooms r
+         ON b.room_id = r.id
+       JOIN users u
+         ON b.user_id = u.id
+       ORDER BY
+         b.booking_date,
+         b.start_time`
+    );
 
     res.status(200).json({
       success: true,
@@ -147,13 +304,21 @@ app.get("/api/bookings", async (req, res) => {
   }
 });
 
+
+// ===============================
+// CANCEL BOOKING
+// ===============================
 app.delete("/api/bookings/:id", async (req, res) => {
   try {
     const result = await pool.query(
-      "DELETE FROM bookings WHERE id = $1 RETURNING *",
+      `DELETE FROM bookings
+       WHERE id = $1
+       RETURNING *`,
       [req.params.id]
     );
 
+
+    // Booking not found
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
@@ -161,6 +326,8 @@ app.delete("/api/bookings/:id", async (req, res) => {
       });
     }
 
+
+    // Booking deleted
     res.status(200).json({
       success: true,
       message: "Booking cancelled successfully"
@@ -176,6 +343,10 @@ app.delete("/api/bookings/:id", async (req, res) => {
   }
 });
 
+
+// ===============================
+// 404 ROUTE
+// ===============================
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -183,6 +354,10 @@ app.use((req, res) => {
   });
 });
 
+
+// ===============================
+// START SERVER
+// ===============================
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
